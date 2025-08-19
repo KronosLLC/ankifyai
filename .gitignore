@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.db
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Logs
+*.log
+
+# Local data files
+adaptive_profile.json
+usage.json
+
+# OS files
+.DS_Store
+Thumbs.db
