@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Ankify.AI — Text → Anki (.apkg)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root{
+      --bg:#0f1115; --panel:#151823; --muted:#8b93a7; --text:#e8ebf4; --accent:#6ea8fe; --accent-2:#8ef0c6;
+      --danger:#ff6b6b; --ok:#8ef0c6; --border:#232838;
+    }
+    *{box-sizing:border-box}
+    body{
+      margin:0; font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Inter,Helvetica,Arial;
+      background:linear-gradient(180deg,#0e1116,#0c0f15 50%,#0e1116); color:var(--text);
+    }
+    .wrap{max-width:860px; margin:32px auto; padding:0 16px;}
+    .header{
+      display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:20px;
+    }
+    .brand{display:flex; align-items:center; gap:12px;}
+    h1{font-size:22px; margin:0}
+    .sub{ color:var(--muted); font-size:13px; margin-top:4px}
+    .pill-box{display:flex; gap:8px; flex-wrap:wrap}
+    .pill{
+      padding:6px 10px; border-radius:999px; border:1px solid #2b3450; color:#cfd6ea; background:#0f1524; font-size:12px;
+    }
+
+    .panel{
+      background:linear-gradient(180deg,#151823,#131722); border:1px solid var(--border);
+      border-radius:16px; padding:18px; box-shadow:0 10px 30px rgba(0,0,0,.25), inset 0 1px 0 rgba(255,255,255,.03);
+    }
+    .section-title{font-size:14px; letter-spacing:.02em; color:#cfd6ea; margin:0 0 10px}
+    .sep{height:1px; background:#1e2435; margin:14px 0}
+
+    textarea{
+      width:100%; min-height:260px; resize:vertical; background:#0f1320; color:var(--text);
+      border:1px solid var(--border); border-radius:12px; padding:14px; line-height:1.45;
+      outline:none; box-shadow: inset 0 0 0 2px rgba(255,255,255,0);
+    }
+    textarea:focus{border-color:#2a3350; box-shadow: inset 0 0 0 2px #20263a;}
+    input[type="text"], input[type="number"]{
+      width:100%; background:#0f1320; color:var(--text); border:1px solid var(--border);
+      border-radius:10px; padding:10px 12px; outline:none;
+    }
+    input[type="text"]:focus, input[type="number"]:focus{border-color:#2a3350}
+
+    .row{display:flex; gap:12px; align-items:center; flex-wrap:wrap}
+    .row > *{flex:1}
+    .stack{display:flex; flex-direction:column; gap:10px}
+
+    .k{color:#cfd6ea; font-size:13px}
+    .hint{color:var(--muted); font-size:12px; margin-top:6px}
+
+    .capsule{
+      display:flex; gap:10px; flex-wrap:wrap;
+      background:#101525; border:1px solid var(--border); padding:12px; border-radius:12px;
+    }
+    .check{
+      display:flex; align-items:center; gap:8px; padding:8px 10px; border:1px solid #22283a; border-radius:10px;
+      background:#101426; cursor:pointer; user-select:none;
+    }
+    .check input{accent-color:var(--accent)}
+
+    .slider-row{display:flex; align-items:center; gap:14px; flex-wrap:wrap}
+    .slider{
+      -webkit-appearance:none; appearance:none; height:6px; border-radius:999px; background:#1c2438; width:100%;
+      outline:none;
+    }
+    .slider::-webkit-slider-thumb{
+      -webkit-appearance:none; appearance:none; width:18px;height:18px;border-radius:50%;
+      background:linear-gradient(180deg,#8ec5ff,#5ea0ff);
+      border:1px solid #2b64cc; box-shadow:0 3px 14px rgba(110,168,254,.5);
+      cursor:pointer;
+    }
+    .badge{
+      font-size:12px; padding:6px 10px; border-radius:999px; border:1px solid #28406a; background:#0d1426;
+      color:#cfe2ff; white-space:nowrap;
+    }
+
+    .actions{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+    .btn{
+      display:inline-flex; align-items:center; justify-content:center; gap:8px;
+      padding:12px 16px; border-radius:12px; border:1px solid #24406a; background:linear-gradient(180deg,#16243c,#0f203c);
+      color:#dbe6ff; cursor:pointer; transition:transform .05s ease; text-decoration:none; font-weight:600;
+    }
+    .btn:hover{ transform:translateY(-1px); }
+    .btn.secondary{ background:#11182a; border-color:#24314a; color:#cfd6ea}
+
+    .status{ font-size:13px; color:var(--muted); }
+    .ok{ color:var(--ok) } .err{ color:var(--danger) }
+
+    .footer{ margin-top:18px; color:#95a0ba; font-size:12px; text-align:center}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <div class="brand">
+        <div>
+          <h1>Ankify.AI</h1>
+          <div class="sub">Paste text → generate polished Anki decks (.apkg) → upload directly to Anki/Noji</div>
+        </div>
+      </div>
+      <div class="pill-box">
+        <span class="pill" id="apiStatus">API: <span>unknown</span></span>
+        <span class="pill" id="usagePill">Usage: …</span>
+      </div>
+    </div>
+
+    <!-- Single central panel -->
+    <div class="panel">
+      <h2 class="section-title">Source Text</h2>
+      <textarea id="inputText" placeholder="Paste full documents or textbook sections here…"></textarea>
+
+      <div class="sep"></div>
+
+      <h2 class="section-title">Deck Settings</h2>
+      <div class="stack">
+        <div class="row">
+          <div>
+            <div class="k">Deck title</div>
+            <input id="deckTitle" type="text" placeholder="e.g., Virology — Retroviruses" />
+            <div class="hint">This becomes the Anki deck name.</div>
+          </div>
+          <div>
+            <div class="k">Minimum cards (floor)</div>
+            <input id="minCards" type="number" min="0" step="1" value="40" />
+            <div class="hint">Balanced mode only: we’ll generate at least this many cards if the text supports it.</div>
+          </div>
+        </div>
+
+        <div>
+          <div class="k">Card types</div>
+          <div class="capsule" id="modesBox">
+            <label class="check"><input type="checkbox" value="Basic Recall (Q/A)" checked>Basic (Q/A)</label>
+            <label class="check"><input type="checkbox" value="Fill in the Blank" checked>Fill in the Blank</label>
+            <label class="check"><input type="checkbox" value="Mechanism (Why/How)" checked>Mechanism (Why/How)</label>
+            <label class="check"><input type="checkbox" value="Scenario" checked>Scenario</label>
+          </div>
+          <div class="hint">Use scenarios for applied reasoning; “fill in the blank” uses Anki cloze deletions.</div>
+        </div>
+
+        <div>
+          <div class="k">Coverage (Yield)</div>
+          <div class="slider-row">
+            <span class="badge" id="yieldBadge">Balanced coverage</span>
+            <input id="yieldSlider" class="slider" type="range" min="0" max="100" step="1" value="60" />
+          </div>
+          <div class="hint" id="yieldHint">
+            0 = exhaustive (attempt one card per fact). 1 = only highest-yield essentials.
+          </div>
+        </div>
+
+        <details>
+          <summary class="k">Advanced</summary>
+          <div class="row" style="margin-top:10px">
+            <div>
+              <div class="k">Chunk size (words)</div>
+              <input id="wordsPerChunk" type="number" min="300" step="50" value="700" />
+              <div class="hint">Larger chunks = fewer API calls, smaller = finer fact extraction. Default 700.</div>
+            </div>
+          </div>
+        </details>
+
+        <div class="sep"></div>
+
+        <div class="actions">
+          <button class="btn" id="buildBtn">Build .apkg</button>
+          <button class="btn secondary" id="checkUsageBtn">Refresh usage</button>
+          <div class="status" id="status">Idle.</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="footer">Ankify.AI runs locally; your .apkg downloads to your machine.</div>
+  </div>
+
+  <script>
+    const $ = (sel)=>document.querySelector(sel);
+    const apiStatus = $("#apiStatus span");
+    const usagePill = $("#usagePill");
+    const statusEl = $("#status");
+
+    function setStatus(msg, ok=null){
+      statusEl.textContent = msg;
+      statusEl.className = "status";
+      if(ok === true) statusEl.classList.add("ok");
+      if(ok === false) statusEl.classList.add("err");
+    }
+
+    // Yield slider labeling
+    const yieldSlider = $("#yieldSlider");
+    const yieldBadge = $("#yieldBadge");
+    const yieldHint = $("#yieldHint");
+
+    function updateYieldUI(){
+      const v = Number(yieldSlider.value)/100.0; // 0..1
+      let label, desc;
+      if(v <= 0.01){ label = "Exhaustive"; desc="Attempt one card per fact (two-pass)."; }
+      else if(v <= 0.25){ label = "Broad coverage"; desc="More granular facts and definitions."; }
+      else if(v <= 0.6){ label = "Balanced coverage"; desc="Mix of key concepts and coverage."; }
+      else if(v < 1.0){ label = "High-yield focus"; desc="Primarily highest-yield material."; }
+      else { label = "Only highest-yield"; desc="Strictly the essentials."; }
+      yieldBadge.textContent = label;
+      yieldHint.textContent = "0 = exhaustive (attempt one card per fact). 1 = only highest-yield essentials. " + desc;
+    }
+    yieldSlider.addEventListener("input", updateYieldUI);
+    updateYieldUI();
+
+    // Modes collection
+    function getSelectedModes(){
+      return Array.from(document.querySelectorAll('#modesBox input[type="checkbox"]:checked'))
+        .map(cb => cb.value);
+    }
+
+    // Health & usage
+    async function refreshHealth(){
+      try{
+        const r = await fetch("/healthz");
+        apiStatus.textContent = r.ok ? "ok" : "unavailable";
+      }catch{
+        apiStatus.textContent = "unavailable";
+      }
+    }
+    async function refreshUsage(){
+      try{
+        const r = await fetch("/usage");
+        if(!r.ok) throw new Error("usage failed");
+        const j = await r.json();
+        usagePill.textContent = `Usage: ${j.cards_used ?? 0} / ${j.cap ?? "?"} (month: ${j.month ?? "?"})`;
+      }catch{
+        usagePill.textContent = "Usage: unavailable";
+      }
+    }
+
+    $("#checkUsageBtn").addEventListener("click", refreshUsage);
+
+    // Build .apkg
+    $("#buildBtn").addEventListener("click", async ()=>{
+      const text = $("#inputText").value.trim();
+      const deckTitle = $("#deckTitle").value.trim() || "Ankify.AI Deck";
+      const yieldLevel = Number(yieldSlider.value)/100.0;
+      const modes = getSelectedModes();
+      const approxCards = Math.max(0, parseInt($("#minCards").value || "0", 10));
+      const wordsPerChunk = Math.max(300, parseInt($("#wordsPerChunk").value || "700", 10));
+
+      if(!text){
+        setStatus("Please paste some text.", false);
+        return;
+      }
+      if(modes.length === 0){
+        setStatus("Select at least one card type.", false);
+        return;
+      }
+
+      setStatus("Building deck… this may take a moment.");
+
+      const payload = {
+        deck_title: deckTitle,
+        text,
+        yield_level: yieldLevel,
+        modes,
+        approx_cards: approxCards,   // used only in balanced mode
+        words_per_chunk: wordsPerChunk
+        // No batch_size: backend auto-decides based on yield
+      };
+
+      try{
+        const r = await fetch("/build-apkg", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify(payload)
+        });
+
+        if(!r.ok){
+          const msg = await r.text();
+          setStatus(`Error: ${msg}`, false);
+          return;
+        }
+
+        // Handle file download from send_file
+        const blob = await r.blob();
+        const cd = r.headers.get("Content-Disposition") || "";
+        const match = cd.match(/filename\*=UTF-8''([^;]+)|filename="?([^"]+)"?/i);
+        let filename = "AnkifyAI.apkg";
+        if(match){
+          filename = decodeURIComponent(match[1] || match[2]).replace(/[/\\]/g, "_");
+        }else{
+          filename = deckTitle.replace(/\s+/g,"_") + ".apkg";
+        }
+
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        URL.revokeObjectURL(url);
+
+        setStatus(`Deck built: ${filename}`, true);
+        refreshUsage();
+      }catch(err){
+        setStatus(`Request failed: ${err}`, false);
+      }
+    });
+
+    // Initial
+    refreshHealth();
+    refreshUsage();
+  </script>
+</body>
+</html>
