@@ -2,14 +2,22 @@
 import os
 import re
 import json
+import time
+import sqlite3
 import hashlib
 import tempfile
 from datetime import datetime
 from typing import List, Dict, Any
 
-from flask import Flask, request, send_file, send_from_directory, jsonify
+from flask import Flask, request, send_file, send_from_directory, jsonify, Response
 import genanki
 import requests
+import stripe
+
+# ───────────────────────── Env: Stripe ─────────────────────────
+stripe.api_key = os.getenv("STRIPE_SECRET_KEY")               # sk_test_... or sk_live_...
+STRIPE_PRICE_ID = os.getenv("STRIPE_PRICE_ID")                # price_...
+STRIPE_WEBHOOK_SECRET = os.getenv("STRIPE_WEBHOOK_SECRET")    # whsec_...
 
 # ───────────────────────── Paths & Flask ─────────────────────────
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))   # .../AnkifyAI/app
@@ -23,15 +31,196 @@ app = Flask(
     static_folder=STATIC_DIR,
     static_url_path="/static"
 )
+# Safety: cap request body (~2 MB) to avoid OOM on tiny instances
+app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024
 
 @app.route("/")
 def index():
     # Serves static/client.html (must exist at AnkifyAI/static/client.html)
     return send_from_directory(app.static_folder, "client.html")
 
-# ───────────────────────── Usage (monthly cap) — robust ─────────────────────────
+# ───────────────────────── Subscription DB (SQLite) ─────────────────────────
+# Option B: default to a portable, project-local path and ensure the directory exists
+DB_PATH = os.environ.get("SUBS_DB_PATH", os.path.join(DATA_DIR, "subscriptions.db"))
+
+def _db():
+    dbdir = os.path.dirname(DB_PATH)
+    if dbdir and not os.path.exists(dbdir):
+        os.makedirs(dbdir, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def _init_db():
+    with _db() as conn:
+        conn.execute("""
+          CREATE TABLE IF NOT EXISTS subscriptions (
+            email TEXT PRIMARY KEY,
+            status TEXT,                 -- active, trialing, past_due, canceled, incomplete, unpaid
+            current_period_end INTEGER,  -- epoch seconds
+            customer_id TEXT,
+            subscription_id TEXT,
+            updated_at INTEGER
+          );
+        """)
+        conn.commit()
+_init_db()
+
+def upsert_subscription(email, status, cpe, customer_id=None, subscription_id=None):
+    email = (email or "").strip().lower()
+    now = int(time.time())
+    with _db() as conn:
+        conn.execute("""
+          INSERT INTO subscriptions(email, status, current_period_end, customer_id, subscription_id, updated_at)
+          VALUES (?, ?, ?, ?, ?, ?)
+          ON CONFLICT(email) DO UPDATE SET
+            status=excluded.status,
+            current_period_end=excluded.current_period_end,
+            customer_id=COALESCE(excluded.customer_id, customer_id),
+            subscription_id=COALESCE(excluded.subscription_id, subscription_id),
+            updated_at=excluded.updated_at;
+        """, (email, (status or ""), int(cpe or 0), customer_id, subscription_id, now))
+        conn.commit()
+
+def get_subscription(email):
+    email = (email or "").strip().lower()
+    with _db() as conn:
+        cur = conn.execute("SELECT * FROM subscriptions WHERE email=?", (email,))
+        return cur.fetchone()
+
+def is_active(sub_row):
+    if not sub_row:
+        return False
+    status = (sub_row["status"] or "").lower()
+    cpe = int(sub_row["current_period_end"] or 0)
+    if status not in ("active", "trialing"):
+        return False
+    return cpe >= int(time.time())
+
+# (Optional) small admin peek endpoint for testing; remove or protect later.
+@app.get("/admin/subscriptions")
+def admin_subs():
+    email = (request.args.get("email") or "").strip().lower()
+    if not email:
+        return ("Provide ?email=", 400)
+    row = get_subscription(email)
+    if not row:
+        return jsonify({"email": email, "found": False})
+    return jsonify({
+        "email": email,
+        "status": row["status"],
+        "current_period_end": row["current_period_end"],
+        "customer_id": row["customer_id"],
+        "subscription_id": row["subscription_id"],
+        "found": True
+    })
+
+# ───────────────────────── Stripe: Checkout + Portal + Webhook ─────────────────────────
+@app.post("/api/checkout")
+def api_checkout():
+    """
+    Body: { "email": "you@example.com" }
+    Returns: { "url": "https://checkout.stripe.com/..." }
+    """
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        return ("Email required", 400)
+
+    host = request.host_url.rstrip("/")
+    success_url = f"{host}/?subscribed=1"
+    cancel_url  = f"{host}/?canceled=1"
+
+    try:
+        session = stripe.checkout.Session.create(
+            mode="subscription",
+            payment_method_types=["card"],
+            line_items=[{"price": STRIPE_PRICE_ID, "quantity": 1}],
+            success_url=success_url,
+            cancel_url=cancel_url,
+            customer_email=email,
+            allow_promotion_codes=False
+        )
+        # pre-create row as 'incomplete' (status will update via webhook)
+        upsert_subscription(email, "incomplete", None, None, None)
+        return jsonify({"url": session.url})
+    except Exception as e:
+        return (f"Checkout error: {e}", 400)
+
+@app.post("/api/billing-portal")
+def billing_portal():
+    """
+    Body: { "email": "you@example.com" }
+    Returns: { "url": "https://billing.stripe.com/session/..." }
+    """
+    data = request.get_json(silent=True) or {}
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        return ("Email required", 400)
+
+    row = get_subscription(email)
+    if not row or not row["customer_id"]:
+        return ("No Stripe customer found for this email. Subscribe first.", 404)
+
+    return_url = request.host_url.rstrip("/") + "/"
+    try:
+        session = stripe.billing_portal.Session.create(
+            customer=row["customer_id"],
+            return_url=return_url
+        )
+        return jsonify({"url": session.url})
+    except Exception as e:
+        return (f"Billing portal error: {e}", 400)
+
+@app.post("/api/stripe/webhook")
+def stripe_webhook():
+    payload = request.data
+    sig = request.headers.get("Stripe-Signature")
+    try:
+        event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+    except Exception as e:
+        return Response(f"Webhook signature error: {e}", status=400)
+
+    et = event["type"]
+    obj = event["data"]["object"]
+
+    # Checkout completed → we learn email + customer/sub ids
+    if et == "checkout.session.completed":
+        email = ((obj.get("customer_details") or {}).get("email") or "").lower()
+        customer_id = obj.get("customer")
+        subscription_id = obj.get("subscription")
+        if email:
+            upsert_subscription(email, "incomplete", None, customer_id, subscription_id)
+
+    # Subscription lifecycle updates → status + current_period_end
+    if et in ("customer.subscription.created", "customer.subscription.updated"):
+        customer_id = obj.get("customer")
+        status = obj.get("status")  # active, trialing, past_due, canceled, unpaid, incomplete
+        cpe = obj.get("current_period_end")   # epoch seconds
+        if customer_id:
+            try:
+                cust = stripe.Customer.retrieve(customer_id)
+                email = (cust.get("email") or "").lower()
+                if email:
+                    upsert_subscription(email, status, cpe, customer_id, obj.get("id"))
+            except Exception:
+                pass
+
+    if et == "customer.subscription.deleted":
+        customer_id = obj.get("customer")
+        if customer_id:
+            try:
+                cust = stripe.Customer.retrieve(customer_id)
+                email = (cust.get("email") or "").lower()
+                if email:
+                    upsert_subscription(email, "canceled", int(time.time()), customer_id, obj.get("id"))
+            except Exception:
+                pass
+
+    return {"ok": True}
+
+# ───────────────────────── Usage (monthly cap via JSON file) ─────────────────────────
 USAGE_PATH = os.path.join(DATA_DIR, "adaptive_profile.json")
-# Default cap is 50,000 (can be overridden by env OPENAI_MONTHLY_CAP)
 DEFAULT_CAP_CARDS_PER_MONTH = int(os.environ.get("OPENAI_MONTHLY_CAP", "50000"))
 USAGE_SCHEMA_VERSION = 1  # bump if schema changes
 
@@ -44,7 +233,6 @@ def _usage_defaults() -> dict:
     }
 
 def _validate_and_patch_usage(data: dict) -> dict:
-    """Ensure required keys exist and patch missing ones; handle month rollover."""
     base = _usage_defaults()
     if not isinstance(data, dict):
         return base
@@ -72,7 +260,6 @@ def _validate_and_patch_usage(data: dict) -> dict:
     return out
 
 def _save_usage_atomic(data: dict) -> None:
-    """Atomic write: write to temp file, then replace (safe on Windows & POSIX)."""
     os.makedirs(DATA_DIR, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix="usage_", suffix=".json", dir=DATA_DIR)
     try:
@@ -107,15 +294,10 @@ def save_usage(data: dict) -> None:
 
 @app.get("/usage")
 def usage_endpoint():
-    """Read-only usage status endpoint."""
     return load_usage()
 
 @app.post("/usage/reset")
 def usage_reset():
-    """
-    Optional reset (admin use). POST {"cap": 50000} to set a new cap and reset cards_used.
-    You can comment this route out in production if not needed.
-    """
     body = request.get_json(silent=True) or {}
     cap = body.get("cap")
     data = _usage_defaults()
@@ -158,20 +340,15 @@ OPENAI_MODEL   = os.environ.get("OPENAI_MODEL", "gpt-4o-mini").strip()  # mini b
 OPENAI_URL     = "https://api.openai.com/v1/chat/completions"
 
 # ───────────────────────── Text helpers ─────────────────────────
-CITATION_BRACKETS = re.compile(r"\[\s*\d+\s*\]")
-MULTI_SPACE = re.compile(r"\s+")
-
 def clean_text(text: str) -> str:
+    CITATION_BRACKETS = re.compile(r"\[\s*\d+\s*\]")
+    MULTI_SPACE = re.compile(r"\s+")
     text = CITATION_BRACKETS.sub("", text)
     text = text.replace("\u00a0", " ")
     text = MULTI_SPACE.sub(" ", text).strip()
     return text
 
 def chunk_by_words(text: str, target_words=700, overlap=120) -> List[str]:
-    """
-    Split text into overlapping word chunks so boundary facts aren't lost.
-    Example: 700 word chunks with 120 word overlap.
-    """
     words = clean_text(text).split()
     if not words:
         return []
@@ -182,28 +359,18 @@ def chunk_by_words(text: str, target_words=700, overlap=120) -> List[str]:
         chunk = " ".join(words[i:i+target_words])
         if chunk.strip():
             chunks.append(chunk)
-        step = max(1, target_words - overlap)  # advance with overlap
+        step = max(1, target_words - overlap)
         i += step
     return chunks
 
 # ───────────────────────── Yield → Density & Targets ─────────────────────────
 def cards_per_1000_words(yield_level: float) -> float:
-    """
-    Map yield (0..1) to card density.
-      yield=0.0 → broad coverage → ~18 cards / 1000 words
-      yield=1.0 → highest-yield only → ~6 cards / 1000 words
-    """
     y = max(0.0, min(1.0, yield_level))
     min_density = 6.0
     max_density = 18.0
-    # inverse relation: low yield => high density; high yield => low density
     return min_density + (1.0 - y) * (max_density - min_density)
 
 def estimate_total_cards(raw_text: str, approx_cards: int, yield_level: float) -> int:
-    """
-    Estimate total card target from text length and yield density,
-    then blend with user's approx_cards by taking the max (to avoid under-coverage).
-    """
     total_words = len(clean_text(raw_text).split())
     auto = int(round((total_words / 1000.0) * cards_per_1000_words(yield_level)))
     return max(approx_cards, auto)
@@ -220,16 +387,11 @@ def parse_json_array(s: str):
 
 # ───────────────────────── Fact extraction & card building ─────────────────────────
 def normalize_fact(f: str) -> str:
-    """Normalize a fact for deduping."""
     t = clean_text(f).lower()
-    t = re.sub(r"\s*\.\s*$", "", t)  # strip trailing period
+    t = re.sub(r"\s*\.\s*$", "", t)
     return t
 
 def ai_extract_facts(chunk_text: str, max_facts: int) -> List[Dict[str, Any]]:
-    """
-    Extract atomic, testable, non-overlapping facts from text chunk.
-    Returns list of {"fact": "..."}.
-    """
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not set in environment.")
 
@@ -274,17 +436,13 @@ RETURN: STRICT JSON ARRAY ONLY.
     return out
 
 def ai_cards_from_facts(facts: List[Dict[str, Any]], modes: List[str]) -> List[Dict[str, Any]]:
-    """
-    Convert a list of fact dicts into flashcards.
-    Returns list of {front, back, mode}.
-    """
     if not facts:
         return []
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not set in environment.")
 
     banned = ["What does this mean", "Which of the following", "True or False", "T/F", "Select all that apply"]
-    facts_json = json.dumps(facts[:50], ensure_ascii=False)  # batch size for efficiency
+    facts_json = json.dumps(facts[:50], ensure_ascii=False)
 
     sys = "You turn atomic facts into precise Anki flashcards. Output STRICT JSON only."
     usr = f"""
@@ -320,7 +478,7 @@ RULES:
 
     out = []
     for it in items:
-        if not isinstance(it, dict): 
+        if not isinstance(it, dict):
             continue
         front = (it.get("front") or "").strip()
         back  = (it.get("back") or "").strip()
@@ -331,9 +489,6 @@ RULES:
 
 # ───────────────────────── Balanced (single-pass) generator ─────────────────────────
 def ai_generate_batch(chunk_text: str, n_cards: int, modes: List[str], yield_level: float) -> List[Dict[str, Any]]:
-    """
-    Ask directly for up to n_cards from a chunk (fast/cheap).
-    """
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY not set in environment.")
 
@@ -405,37 +560,41 @@ REQUIREMENTS:
 
 # ───────────────────────── Adaptive per-call sizing ─────────────────────────
 def choose_call_size(yield_level: float, remaining_overall: int, remaining_for_chunk: int) -> int:
-    """
-    Decide how many cards to request in *this* API call.
-    Smaller at high-yield; larger at low-yield; never exceed remaining quotas.
-    """
     # Base per-call size from yield (0→12, 1→6)
     base = int(round(12 - 6 * max(0.0, min(1.0, yield_level))))
-    base = max(3, min(16, base))  # clamp a bit
-    # Also consider how much remains (scale up if lots left)
+    base = max(3, min(16, base))
     if remaining_overall > 100:
         base = min(20, base + 4)
     return max(1, min(base, remaining_overall, remaining_for_chunk))
 
-# ───────────────────────── Build .apkg ─────────────────────────
+# ───────────────────────── Build .apkg (now gated by subscription) ─────────────────────────
 @app.post("/build-apkg")
 def build_apkg():
     """
     JSON body:
     {
+      "email": "you@example.com",          # REQUIRED for subscription gate
       "deck_title": "My Deck",
       "text": "Paste your study text here...",
-      "yield_level": 0.6,         # 0..1; 0 auto-switches to exhaustive coverage
+      "yield_level": 0.6,                  # 0..1; 0 → exhaustive coverage
       "modes": ["Basic Recall (Q/A)","Fill in the Blank","Mechanism (Why/How)","Scenario"],
-      "approx_cards": 40,         # used only for balanced mode as a floor
-      "words_per_chunk": 700      # rough chunk size by words
+      "approx_cards": 40,                  # used only for balanced mode as a floor
+      "words_per_chunk": 700               # rough chunk size by words
     }
     - Uses ONLY gpt-4o-mini for AI generation.
-    - Enforces a global monthly cap via data/adaptive_profile.json.
-    - Yield=0 → Exhaustive pipeline (try one card per fact, up to cap).
-    - Yield>0 → Balanced pipeline (density-based), with adaptive per-call sizing.
+    - Enforces monthly cap via data/adaptive_profile.json.
+    - Requires active Stripe subscription for the provided email.
     """
     data = request.get_json(silent=True) or {}
+
+    # Subscription gate
+    email = (data.get("email") or "").strip().lower()
+    if not email:
+        return ("Email is required", 400)
+    sub = get_subscription(email)
+    if not is_active(sub):
+        return ("Subscription inactive. Please subscribe to continue.", 402)
+
     deck_title   = (data.get("deck_title") or "AnkifyAI Deck").strip()
     raw_text     = data.get("text") or ""
     yield_level  = float(data.get("yield_level", 0.6))
@@ -486,8 +645,7 @@ def build_apkg():
         all_facts_normed = set()
         all_facts: List[str] = []
 
-        # Generous facts per chunk: scale with chunk length (≈ 110 facts / 1k words)
-        # Keeps going up to monthly cap later.
+        # Generous facts per chunk: scale with chunk length (≈110 facts / 1k words)
         for ch in chunks:
             ch_words = len(clean_text(ch).split())
             max_facts = max(40, int(round((ch_words / 1000.0) * 110)))
@@ -596,7 +754,6 @@ def build_apkg():
                     usage["cards_used"] += actually_added
                     save_usage(usage)
                 else:
-                    # model gave nothing usable; break to avoid infinite loop
                     break
 
         # Optional round-robin sweep to use any leftover budget
@@ -657,5 +814,4 @@ if __name__ == "__main__":
     print("Open UI:   http://localhost:8020/")
     print("Health:    http://localhost:8020/healthz")
     print("Usage:     http://localhost:8020/usage")
-    # Important: use_reloader=False so it doesn't detach on Windows
     app.run(host="0.0.0.0", port=8020, debug=True, use_reloader=False)

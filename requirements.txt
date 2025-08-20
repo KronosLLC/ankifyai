@@ -1,4 +1,7 @@
 flask
+flask-cors
+openai
+stripe
 genanki
 requests
 gunicorn

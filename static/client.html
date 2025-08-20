@@ -25,6 +25,8 @@
     .pill{
       padding:6px 10px; border-radius:999px; border:1px solid #2b3450; color:#cfd6ea; background:#0f1524; font-size:12px;
     }
+    .pill.ok{ border-color:#1f5c43; background:#0f1f1b; color:#b8f5db; }
+    .pill.warn{ border-color:#5c3a1f; background:#1f1710; color:#ffd6a8; }
 
     .panel{
       background:linear-gradient(180deg,#151823,#131722); border:1px solid var(--border);
@@ -39,18 +41,18 @@
       outline:none; box-shadow: inset 0 0 0 2px rgba(255,255,255,0);
     }
     textarea:focus{border-color:#2a3350; box-shadow: inset 0 0 0 2px #20263a;}
-    input[type="text"], input[type="number"]{
+    input[type="text"], input[type="email"], input[type="number"]{
       width:100%; background:#0f1320; color:var(--text); border:1px solid var(--border);
       border-radius:10px; padding:10px 12px; outline:none;
     }
-    input[type="text"]:focus, input[type="number"]:focus{border-color:#2a3350}
+    input[type="text"]:focus, input[type="email"]:focus, input[type="number"]:focus{border-color:#2a3350}
 
-    .row{display:flex; gap:12px; align-items:center; flex-wrap:wrap}
+    .row{display:flex; gap:12px; align-items:flex-end; flex-wrap:wrap}
     .row > *{flex:1}
     .stack{display:flex; flex-direction:column; gap:10px}
 
     .k{color:#cfd6ea; font-size:13px}
-    .hint{color:var(--muted); font-size:12px; margin-top:6px}
+    .hint{color:#8b93a7; font-size:12px; margin-top:6px}
 
     .capsule{
       display:flex; gap:10px; flex-wrap:wrap;
@@ -91,6 +93,7 @@
     .ok{ color:var(--ok) } .err{ color:var(--danger) }
 
     .footer{ margin-top:18px; color:#95a0ba; font-size:12px; text-align:center}
+    .hidden{ display:none !important; }
   </style>
 </head>
 <body>
@@ -103,6 +106,7 @@
         </div>
       </div>
       <div class="pill-box">
+        <span class="pill" id="signedInPill" class="hidden" style="display:none;"></span>
         <span class="pill" id="apiStatus">API: <span>unknown</span></span>
         <span class="pill" id="usagePill">Usage: …</span>
       </div>
@@ -110,6 +114,21 @@
 
     <!-- Single central panel -->
     <div class="panel">
+      <h2 class="section-title">Account</h2>
+      <div class="row">
+        <div>
+          <div class="k">Email (used for billing)</div>
+          <input id="userEmail" type="email" placeholder="you@example.com" autocomplete="email" />
+          <div class="hint">Use the same email at checkout; it unlocks generation & lets you manage billing.</div>
+        </div>
+        <div style="flex:0 0 240px; display:flex; flex-direction:column; gap:8px; align-items:stretch;">
+          <button class="btn" id="subscribeBtn">$5/month — Subscribe</button>
+          <button class="btn secondary" id="manageBillingBtn">Manage billing</button>
+        </div>
+      </div>
+
+      <div class="sep"></div>
+
       <h2 class="section-title">Source Text</h2>
       <textarea id="inputText" placeholder="Paste full documents or textbook sections here…"></textarea>
 
@@ -173,7 +192,7 @@
       </div>
     </div>
 
-    <div class="footer">Ankify.AI runs locally; your .apkg downloads to your machine.</div>
+    <div class="footer">Ankify.AI runs in the cloud; your .apkg downloads to your machine.</div>
   </div>
 
   <script>
@@ -181,6 +200,9 @@
     const apiStatus = $("#apiStatus span");
     const usagePill = $("#usagePill");
     const statusEl = $("#status");
+    const signedInPill = $("#signedInPill");
+    const emailInput = $("#userEmail");
+    const subscribeBtn = $("#subscribeBtn");
 
     function setStatus(msg, ok=null){
       statusEl.textContent = msg;
@@ -236,8 +258,135 @@
 
     $("#checkUsageBtn").addEventListener("click", refreshUsage);
 
+    // Subscription status check
+    async function checkSubscription(email){
+      if(!email) {
+        setSignedInPill(null);
+        showSubscribe(true);
+        return;
+      }
+      try{
+        const r = await fetch(`/admin/subscriptions?email=${encodeURIComponent(email)}`);
+        if(!r.ok){ setSignedInPill(null); showSubscribe(true); return; }
+        const j = await r.json();
+        if(j.found && (j.status === "active" || j.status === "trialing") && Number(j.current_period_end || 0) * 1000 >= Date.now()){
+          setSignedInPill(email);
+          showSubscribe(false);
+        }else{
+          setSignedInPill(null);
+          showSubscribe(true);
+        }
+      }catch{
+        setSignedInPill(null);
+        showSubscribe(true);
+      }
+    }
+
+    function setSignedInPill(email){
+      if(email){
+        signedInPill.textContent = `Signed in as ${email} — Active`;
+        signedInPill.classList.add("ok");
+        signedInPill.style.display = "";
+      }else{
+        signedInPill.textContent = "";
+        signedInPill.classList.remove("ok");
+        signedInPill.style.display = "none";
+      }
+    }
+
+    function showSubscribe(show){
+      if(show){
+        subscribeBtn.classList.remove("hidden");
+        subscribeBtn.style.display = "";
+      }else{
+        subscribeBtn.classList.add("hidden");
+        subscribeBtn.style.display = "none";
+      }
+    }
+
+    // Save/restore email
+    function restoreEmail(){
+      try{
+        const saved = localStorage.getItem("ankify_email");
+        if(saved){ emailInput.value = saved; }
+      }catch{}
+    }
+    function persistEmail(){
+      try{
+        const v = emailInput.value.trim().toLowerCase();
+        if(v){ localStorage.setItem("ankify_email", v); }
+      }catch{}
+    }
+
+    // Subscribe via Stripe Checkout
+    async function subscribe(){
+      const email = emailInput.value.trim().toLowerCase();
+      if(!email){
+        setStatus("Enter your email before subscribing.", false);
+        return;
+      }
+      persistEmail();
+      setStatus("Creating checkout session…");
+      try{
+        const r = await fetch("/api/checkout", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({ email })
+        });
+        if(!r.ok){
+          const t = await r.text();
+          setStatus(`Checkout error: ${t}`, false);
+          return;
+        }
+        const j = await r.json();
+        if(j.url){
+          window.location = j.url; // redirect to Stripe Checkout
+        }else{
+          setStatus("Unexpected checkout response.", false);
+        }
+      }catch(err){
+        setStatus(`Checkout failed: ${err}`, false);
+      }
+    }
+    $("#subscribeBtn").addEventListener("click", subscribe);
+
+    // Manage billing (Stripe Customer Portal)
+    async function manageBilling(){
+      const email = emailInput.value.trim().toLowerCase();
+      if(!email){
+        setStatus("Enter your email to manage billing.", false);
+        return;
+      }
+      persistEmail();
+      setStatus("Opening billing portal…");
+      try{
+        const r = await fetch("/api/billing-portal", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify({ email })
+        });
+        if(!r.ok){
+          const t = await r.text();
+          setStatus(`Billing portal error: ${t}`, false);
+          return;
+        }
+        const j = await r.json();
+        if(j.url){ window.location = j.url; }
+        else { setStatus("Unexpected portal response.", false); }
+      }catch(err){
+        setStatus(`Billing portal request failed: ${err}`, false);
+      }
+    }
+    $("#manageBillingBtn").addEventListener("click", manageBilling);
+
     // Build .apkg
     $("#buildBtn").addEventListener("click", async ()=>{
+      const email = emailInput.value.trim().toLowerCase();
+      if(!email){
+        setStatus("Enter your email (must match your subscription).", false);
+        return;
+      }
+      persistEmail();
       const text = $("#inputText").value.trim();
       const deckTitle = $("#deckTitle").value.trim() || "Ankify.AI Deck";
       const yieldLevel = Number(yieldSlider.value)/100.0;
@@ -257,13 +406,13 @@
       setStatus("Building deck… this may take a moment.");
 
       const payload = {
+        email,
         deck_title: deckTitle,
         text,
         yield_level: yieldLevel,
         modes,
         approx_cards: approxCards,   // used only in balanced mode
         words_per_chunk: wordsPerChunk
-        // No batch_size: backend auto-decides based on yield
       };
 
       try{
@@ -276,6 +425,8 @@
         if(!r.ok){
           const msg = await r.text();
           setStatus(`Error: ${msg}`, false);
+          // Re-check subscription in case the failure was due to inactive status
+          checkSubscription(email);
           return;
         }
 
@@ -300,14 +451,58 @@
 
         setStatus(`Deck built: ${filename}`, true);
         refreshUsage();
+        checkSubscription(email); // keep UI in sync
       }catch(err){
         setStatus(`Request failed: ${err}`, false);
+        checkSubscription(email);
       }
     });
 
+    // Parse query params (handle return from Stripe: ?subscribed=1)
+    function getQuery(){
+      const q = {};
+      (location.search || "").replace(/^\?/, "").split("&").forEach(kv=>{
+        if(!kv) return;
+        const [k,v] = kv.split("=");
+        q[decodeURIComponent(k||"")] = decodeURIComponent(v||"");
+      });
+      return q;
+    }
+
     // Initial
-    refreshHealth();
-    refreshUsage();
+    (function init(){
+      refreshHealth();
+      refreshUsage();
+
+      // restore email
+      restoreEmail();
+
+      // check status on load & when email changes
+      const email = emailInput.value.trim().toLowerCase();
+      if(email){ checkSubscription(email); }
+
+      emailInput.addEventListener("change", ()=>{
+        const v = emailInput.value.trim().toLowerCase();
+        persistEmail();
+        checkSubscription(v);
+      });
+      emailInput.addEventListener("blur", ()=>{
+        const v = emailInput.value.trim().toLowerCase();
+        persistEmail();
+        checkSubscription(v);
+      });
+
+      // If redirected back from Stripe with ?subscribed=1, re-check
+      const qp = getQuery();
+      if(qp.subscribed === "1" || qp.canceled === "1"){
+        const v = emailInput.value.trim().toLowerCase();
+        if(v){ setStatus("Updating subscription status…"); checkSubscription(v); }
+        // Optionally clean the URL bar:
+        if(history.replaceState){
+          history.replaceState(null, "", location.pathname);
+        }
+      }
+    })();
   </script>
 </body>
 </html>
