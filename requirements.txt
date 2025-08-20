@@ -1,3 +1,4 @@
 flask
 genanki
 requests
+gunicorn
